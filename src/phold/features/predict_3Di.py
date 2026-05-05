@@ -22,7 +22,11 @@ from torch import nn
 from tqdm import tqdm
 from transformers import T5EncoderModel, T5Tokenizer, logging, utils
 
-from phold.databases.db import check_prostT5_download, download_zenodo_prostT5
+from phold.databases.db import (
+    check_prostT5_download,
+    convert_bin_to_safetensors_in_cache,
+    download_zenodo_prostT5,
+)
 from phold.utils.constants import CNN_DIR
 
 
@@ -131,37 +135,39 @@ def get_T5_model(
     logger.info(f"Loading T5 from: {model_dir}/{model_name}")
     logger.info(f"If {model_dir}/{model_name} is not found, it will be downloaded")
 
-    # check ProstT5 is downloaded
-    # flag assumes transformers takes from local file (see #44)
-    localfile = True
-    download = False
-
-    download = check_prostT5_download(model_dir, model_name)
-    if download is True:
-        localfile = False
+    # Step 1: ensure model files are present in the HF cache.
+    # check_prostT5_download returns True if any expected blob is missing or
+    # corrupt, in which case we fetch from HF (or fall back to the Zenodo
+    # tarball backup). We use huggingface_hub.snapshot_download instead of
+    # T5EncoderModel.from_pretrained for the download step so that any failure
+    # to load the weights does not prevent re-using files that did download.
+    if check_prostT5_download(model_dir, model_name):
         logger.info("ProstT5 not found. Downloading ProstT5 from Hugging Face")
-    try:
-        # suppress warning
-        logging.set_verbosity_error()
-        model = T5EncoderModel.from_pretrained(
-            model_name,
-            cache_dir=f"{model_dir}/",
-            force_download=download,
-            local_files_only=localfile,
-        ).to(device)
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=model_name, cache_dir=f"{model_dir}/")
+        except Exception as e:
+            logger.warning(
+                f"Download from Hugging Face failed ({e}). "
+                "Trying backup from Zenodo."
+            )
+            logdir = f"{model_dir}/logdir"
+            download_zenodo_prostT5(model_dir, logdir, threads)
 
-    except:
-        logger.warning("Download from Hugging Face failed. Trying backup from Zenodo.")
-        logdir = f"{model_dir}/logdir"
-        download_zenodo_prostT5(model_dir, logdir, threads)
-        logging.set_verbosity_error()
+    # Step 2: convert pytorch_model.bin to model.safetensors if needed.
+    # transformers (>=4.49) blocks torch.load on .bin files when torch<2.6
+    # (CVE-2025-32434). The Rostlab/ProstT5_fp16 repo only ships .bin, so we
+    # convert locally. No-op if model.safetensors already exists.
+    convert_bin_to_safetensors_in_cache(model_dir, model_name)
 
-        model = T5EncoderModel.from_pretrained(
-            model_name,
-            cache_dir=f"{model_dir}/",
-            force_download=False,
-            local_files_only=True,
-        ).to(device)
+    # Step 3: load the model from the local cache.
+    logging.set_verbosity_error()
+    model = T5EncoderModel.from_pretrained(
+        model_name,
+        cache_dir=f"{model_dir}/",
+        force_download=False,
+        local_files_only=True,
+    ).to(device)
 
     vocab = T5Tokenizer.from_pretrained(
         model_name, cache_dir=f"{model_dir}/", do_lower_case=False

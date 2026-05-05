@@ -361,7 +361,7 @@ def download_zenodo_prostT5(model_dir, logdir, threads):
     tarball = VERSION_DICTIONARY[CURRENT_DB_VERSION]["prostt5_backup_tarball"]
     tarball_path = Path(f"{model_dir}/{tarball}")
 
-    download_requests(db_url, tarball_path, logdir, threads)
+    download_requests(db_url, tarball_path)
     md5_sum = calc_md5_sum(tarball_path)
 
     if md5_sum == requiredmd5:
@@ -388,6 +388,106 @@ def download_zenodo_prostT5(model_dir, logdir, threads):
     tarball_path.unlink()
 
 
+def convert_bin_to_safetensors_in_cache(model_dir: Path, model_name: str) -> bool:
+    """
+    Convert pytorch_model.bin to model.safetensors inside the HuggingFace cache.
+
+    transformers (>=4.49) refuses to load pytorch_model.bin via torch.load when
+    torch < 2.6 (CVE-2025-32434). The Rostlab/ProstT5_fp16 repo only ships
+    pytorch_model.bin (no safetensors), so on torch < 2.6 we convert it locally
+    once. transformers will then prefer the safetensors file, which has no
+    version restriction.
+
+    Returns True if a conversion was performed, False otherwise.
+    """
+    import torch
+    from safetensors.torch import _remove_duplicate_names, save_file
+
+    model_sub_dir = "models--" + model_name.replace("/", "--")
+    snapshots_dir = Path(model_dir) / model_sub_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return False
+
+    no_exist_dir = Path(model_dir) / model_sub_dir / ".no_exist"
+
+    converted = False
+    for snapshot in snapshots_dir.iterdir():
+        if not snapshot.is_dir():
+            continue
+        bin_path = snapshot / "pytorch_model.bin"
+        safetensors_path = snapshot / "model.safetensors"
+
+        if not bin_path.exists():
+            continue
+
+        # If a safetensors file from a prior buggy phold version is present,
+        # detect it and force re-conversion. Earlier versions of this function
+        # let _remove_duplicate_names pick the kept tensor alphabetically,
+        # which retained `decoder.embed_tokens.weight` and dropped
+        # `shared.weight` — fatal for T5EncoderModel, whose
+        # `encoder.embed_tokens.weight` then silently loads as random.
+        if safetensors_path.exists():
+            try:
+                from safetensors import safe_open
+                with safe_open(str(safetensors_path), framework="pt") as f:
+                    keys = set(f.keys())
+            except Exception:
+                keys = set()
+            if "shared.weight" not in keys:
+                logger.warning(
+                    f"Existing {safetensors_path} is missing 'shared.weight' "
+                    "(produced by an older phold conversion bug). Removing and "
+                    "re-converting from pytorch_model.bin."
+                )
+                safetensors_path.unlink()
+
+        if not safetensors_path.exists():
+            logger.info(
+                f"Converting {bin_path} -> {safetensors_path} "
+                "(workaround for transformers + torch<2.6 / CVE-2025-32434)"
+            )
+
+            state_dict = torch.load(
+                str(bin_path), map_location="cpu", weights_only=True
+            )
+
+            # Drop tensors that share storage; safetensors disallows shared
+            # storage. The tensor we keep must be one transformers can use to
+            # rebuild the tie. For T5 we must keep `shared.weight` — that key
+            # exists for both T5EncoderModel and the full T5 model, and is the
+            # canonical source for `encoder.embed_tokens.weight` /
+            # `decoder.embed_tokens.weight` / `lm_head.weight`. Without
+            # `preferred_names`, _remove_duplicate_names picks alphabetically
+            # (`decoder.embed_tokens.weight`), which T5EncoderModel does not
+            # define and silently falls back to randomly initialised input
+            # embeddings — see the model "loaded" without warnings but the
+            # encoder produces garbage 3Di.
+            to_removes = _remove_duplicate_names(
+                state_dict, preferred_names=["shared.weight"]
+            )
+            metadata = {"format": "pt"}
+            for kept_name, dups in to_removes.items():
+                for dup in dups:
+                    metadata[dup] = kept_name
+                    del state_dict[dup]
+
+            state_dict = {k: v.contiguous() for k, v in state_dict.items()}
+            save_file(state_dict, str(safetensors_path), metadata=metadata)
+            logger.info(f"Conversion complete: {safetensors_path}")
+            converted = True
+
+        # huggingface_hub records "file not on the Hub" by touching
+        # .no_exist/<commit>/<filename>. transformers consults this before
+        # the snapshot dir, so a stale marker would hide the safetensors we
+        # just produced. Drop the marker for this snapshot.
+        marker = no_exist_dir / snapshot.name / "model.safetensors"
+        if marker.exists():
+            marker.unlink()
+            logger.info(f"Removed stale no_exist marker: {marker}")
+
+    return converted
+
+
 def check_prostT5_download(model_dir: Path, model_name: str) -> bool:
     """
      Args:
@@ -410,8 +510,27 @@ def check_prostT5_download(model_dir: Path, model_name: str) -> bool:
         model_sub_dir = "models--gbouras13--ProstT5Phold"
         DICT = PROSTT5_FINETUNE_MD5_DICTIONARY
 
+    # The pytorch_model.bin blob (~5.6 GB) is only needed once, for the
+    # one-time bin -> safetensors conversion (torch<2.6 workaround). Once
+    # model.safetensors is on disk, transformers loads from it and the .bin
+    # blob becomes dead weight. Identify the bin's blob filename via the
+    # snapshot symlink so we can skip its MD5 check after it has been
+    # cleaned up.
+    bin_blob_to_skip = None
+    snapshots_dir = Path(f"{model_dir}/{model_sub_dir}/snapshots")
+    if snapshots_dir.exists():
+        for snap in snapshots_dir.iterdir():
+            if not snap.is_dir():
+                continue
+            if (snap / "model.safetensors").exists():
+                bin_link = snap / "pytorch_model.bin"
+                if bin_link.is_symlink():
+                    bin_blob_to_skip = bin_link.readlink().name
+
     for key in DICT:
         for nested_key in DICT[key]:
+            if key == "blobs" and nested_key == bin_blob_to_skip:
+                continue
             file_path = Path(f"{model_dir}/{model_sub_dir}/{key}/{nested_key}")
 
             # check file exists
